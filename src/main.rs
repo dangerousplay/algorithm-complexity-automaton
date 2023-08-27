@@ -1,14 +1,13 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
-use std::fs::read_to_string;
 use std::io;
-use std::iter::Map;
 use std::path::Path;
-use std::rc::Rc;
-use eyre::{bail, ensure, Report, Result, WrapErr};
+use eyre::{bail, ensure, Report, WrapErr};
 use graphviz_rust::dot_generator::*;
 use graphviz_rust::dot_structures::*;
+use itertools::Itertools;
+
 
 const SIGMA: char = '&';
 
@@ -92,7 +91,7 @@ impl <'a> Transition<'a> {
 
 pub type Transitions<'a> = HashMap<Symbol, Vec<Cow<'a, str>>>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct State<'a> {
     pub name: Cow<'a, str>,
     pub is_final: bool,
@@ -101,7 +100,11 @@ pub struct State<'a> {
 
 impl<'a> State<'a> {
     pub fn new<T: Into<Cow<'a, str>>>(name: T, is_final: bool) -> Self {
-        Self { name: name.into(), is_final, transitions: HashMap::new() }
+        State::new_with_transitions(name, is_final, HashMap::new())
+    }
+
+    pub fn new_with_transitions<T: Into<Cow<'a, str>>>(name: T, is_final: bool, transitions: Transitions<'a>) -> Self {
+        Self { name: name.into(), is_final, transitions }
     }
 }
 
@@ -111,7 +114,7 @@ impl<'a> State<'a> {
 //     pub transitions: Map<Symbol, Vec<State<'a>>>
 // }
 
-
+#[derive(Debug, PartialEq)]
 pub struct Automaton<'a> {
     pub initial_state: State<'a>,
     pub alphabet: Vec<char>,
@@ -149,8 +152,6 @@ impl<'a> Automaton<'a> {
         let states = lines[2].clone().split_whitespace().map(|f| f.to_string()).collect::<Vec<String>>();
         let final_states = lines[3].split_whitespace().map(|f| f.to_string()).collect::<Vec<String>>();
         let transitions_text = lines.iter().skip(4).clone().map(|f| f.to_string()).collect::<Vec<String>>();
-        
-        dbg!(initial_state_text.clone());
         
         ensure!(!initial_state_text.contains(' '), "Invalid initial state: '{}'", initial_state_text);
         ensure!(states.contains(&initial_state_text), "Initial state '{}' not declared in states", initial_state_text);
@@ -206,6 +207,56 @@ impl<'a> Automaton<'a> {
             graph: graph
         })
     }
+
+    pub fn to_dfa(&self) -> Automaton {
+        let dead_state = Cow::from("dead_state");
+
+        let mut visit_states = VecDeque::new();
+
+        let mut dfa = Automaton::new(self.initial_state.clone(), self.alphabet.clone(), HashMap::new());
+
+        visit_states.push_back(vec![self.initial_state.name.clone()]);
+
+        while let Some(states) = visit_states.pop_back() {
+            let state_name = states.iter().join("");
+            let is_final = states.iter().any(|s| self.graph.get(&s.to_string()).unwrap().is_final);
+            let is_initial = states.iter().any(|s| *s == self.initial_state.name);
+
+            let mut transitions: Transitions = HashMap::new();
+
+            for symbol in self.alphabet.clone() {
+                let symbol = Symbol::from(symbol);
+
+                let next_states = states
+                    .iter()
+                    .flat_map(|s| self.graph.get(&s.to_string()).unwrap().transitions.get(&symbol).cloned().unwrap_or(vec![]))
+                    .collect::<Vec<_>>();
+
+                if !next_states.is_empty() {
+                    let next_state_name = next_states.iter().join("");
+
+                    transitions.insert(symbol.clone(), vec![next_state_name.clone().into()]);
+
+                    if !dfa.graph.contains_key(&next_state_name) {
+                        visit_states.push_back(next_states);
+                    }
+                } else {
+                    transitions.insert(symbol.clone(), vec![dead_state.clone()]);
+                }
+            }
+
+            let new_state = State::new_with_transitions(state_name, is_final, transitions);
+
+            if is_initial {
+                dfa.initial_state = new_state.clone();
+            }
+
+            dfa.graph.insert(new_state.name.to_string(), new_state);
+        }
+
+        dfa
+    }
+
 }
 
 impl<'a> From<&Automaton<'a>> for Graph {
@@ -268,17 +319,17 @@ impl<'a> ExecutionContext<'a> {
         let transitions = self.current_state.transitions.get(&input_symbol);
 
         let transitions = match transitions {
-            None => bail!("Not found transition for symbol '{:?}' and state '{:?}'", input_symbol, self.current_state),
+            None => bail!("Not found transition for symbol '{:?}', state '{:?}'", input_symbol, self.current_state),
             Some(v) => v
         };
 
         let next_state = match transitions.first() {
-            None => bail!("Not found next state for symbol '{:?}' and state '{:?}'", input_symbol, self.current_state),
+            None => bail!("Not found next state for symbol '{:?}', state '{:?}'", input_symbol, self.current_state),
             Some(nex_state) => nex_state
         };
 
         let next_state = match self.automaton.graph.get(&next_state.to_string()) {
-            None => bail!("Not found next state '{}' for symbol '{:?}' and state '{:?}'", next_state, input_symbol, self.current_state),
+            None => bail!("Not found next state '{}' for symbol '{:?}', state '{:?}'", next_state, input_symbol, self.current_state),
             Some(nex_state) => nex_state
         };
 
@@ -329,7 +380,16 @@ fn main() -> eyre::Result<(), Report> {
 
 #[cfg(test)]
 mod tests {
+    use graphviz_rust::dot_structures::Graph;
+    use graphviz_rust::printer::{DotPrinter, PrinterContext};
     use crate::{Automaton, ExecutionContext};
+
+    fn print_graph(automaton: &Automaton) {
+        let graph: Graph = automaton.into();
+        let graph_string = graph.print(&mut PrinterContext::default());
+
+        println!("{}", graph_string);
+    }
     
     const EXAMPLE_AUTOMATA: &str = r#"q0
 a b
@@ -342,7 +402,7 @@ q2 q1 b
 q2 q3 a"#;
 
     #[test]
-    pub fn parse_valid_automaton() {
+    fn parse_valid_automaton() {
         let input = EXAMPLE_AUTOMATA.clone();
         
         let actual = Automaton::from_text(input.clone());
@@ -352,7 +412,7 @@ q2 q3 a"#;
     }
     
     #[test]
-    pub fn run_valid_final() {
+    fn run_valid_final() {
         let inputs = vec![
             "aa",
             "aaaaaaaa",
@@ -376,7 +436,7 @@ q2 q3 a"#;
     }
 
     #[test]
-    pub fn run_invalid_symbol() {
+    fn run_invalid_symbol() {
         let inputs = vec![
             "ac",
             "cc",
@@ -395,7 +455,7 @@ q2 q3 a"#;
     }
 
     #[test]
-    pub fn run_invalid_sequence() {
+    fn run_invalid_sequence() {
         let inputs = vec![
             "aaab"
         ];
@@ -414,5 +474,36 @@ q2 q3 a"#;
 
             assert!(!actual.unwrap(), "Should accept input {}", input)
         }
+    }
+
+    #[test]
+    fn to_dfa_simple() {
+        let automaton = r#"a
+0 1
+a b c
+c
+a a 0
+a a 1
+a b 1
+b c 0
+b c 1"#;
+        let automaton = Automaton::from_text(automaton).expect("bug");
+
+        let dfa = automaton.to_dfa();
+
+        let expected = Automaton::from_text(r#"a
+0 1
+a ab ac abc
+abc ac
+a a 0
+a ab 1
+ab ac 0
+ab abc 1
+abc abc 1
+abc ac 0
+ac ab 1
+ac a 0"#).unwrap();
+
+        assert_eq!(expected, dfa);
     }
 }

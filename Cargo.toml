@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 eyre = "0.6.8"
 graphviz-rust = "0.6.6"
+itertools = "0.11.0"
